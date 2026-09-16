@@ -28,6 +28,9 @@ import (
     "github.com/gophercloud/gophercloud/openstack/networking/v2/extensions/layer3/routers"
     "github.com/gophercloud/gophercloud/openstack/networking/v2/ports"
     "github.com/gophercloud/gophercloud/openstack/sharedfilesystems/v2/shares"
+    "github.com/gophercloud/gophercloud/openstack/networking/v2/extensions/layer3/floatingips"
+    "github.com/gophercloud/gophercloud/openstack/networking/v2/networks"
+    "github.com/gophercloud/gophercloud/openstack/networking/v2/subnets"
     "github.com/gophercloud/utils/openstack/clientconfig"
 )
 
@@ -66,26 +69,31 @@ var (
 
 // ResourceKind identifie un type de ressource géré par l'outil.
 type ResourceKind string
-
+ 
 const (
-    KindServer   ResourceKind = "compute/instance"
-    KindSnapshot ResourceKind = "blockstorage/snapshot"
-    KindVolume   ResourceKind = "blockstorage/volume"
-    KindShare    ResourceKind = "sharedfs/share"
-    KindImage    ResourceKind = "image"
-    KindPort     ResourceKind = "network/port"
-    KindRouter   ResourceKind = "network/router"
+    KindServer     ResourceKind = "compute/instance"
+    KindSnapshot   ResourceKind = "blockstorage/snapshot"
+    KindVolume     ResourceKind = "blockstorage/volume"
+    KindShare      ResourceKind = "sharedfs/share"
+    KindImage      ResourceKind = "image"
+    KindFloatingIP ResourceKind = "network/floatingip"
+    KindPort       ResourceKind = "network/port"
+    KindRouter     ResourceKind = "network/router"
+    KindNetwork    ResourceKind = "network/network"
 )
+
 
 // ordre de suppression imposé (respect des dépendances)
 var deletionOrder = []ResourceKind{
-    KindServer,   // a. instances compute (libèrent volumes attachés + ports)
-    KindSnapshot, // b1. snapshots avant volumes (dépendance)
-    KindVolume,   // b2. volumes
-    KindShare,    // c. partages Manila
-    KindImage,    // d. images
-    KindPort,     // e. ports / interfaces réseau
-    KindRouter,   // f. routeurs
+    KindServer,     // a. instances compute (libèrent volumes attachés + ports)
+    KindSnapshot,   // b1. snapshots avant volumes (dépendance)
+    KindVolume,     // b2. volumes
+    KindShare,      // c. partages Manila
+    KindImage,      // d. images
+    KindFloatingIP, // e. floating IPs (avant les ports : une FIP associée bloque le port)
+    KindPort,       // f. ports / interfaces réseau
+    KindRouter,     // g. routeurs
+    KindNetwork,    // h. réseaux (et leurs subnets, en dernier)
 }
 
 /* -------------------------------------------------------------------------- */
@@ -213,8 +221,10 @@ func (cl *Cleaner) Discover() {
         {KindVolume, cl.listVolumes},
         {KindShare, cl.listShares},
         {KindImage, cl.listImages},
+        {KindFloatingIP, cl.listFloatingIPs},
         {KindPort, cl.listPorts},
         {KindRouter, cl.listRouters},
+        {KindNetwork, cl.listNetworks},
     }
 
     for _, l := range listers {
@@ -240,7 +250,71 @@ func (cl *Cleaner) Discover() {
         }
     }
 }
+func (cl *Cleaner) listFloatingIPs() ([]Resource, error) {
+    if cl.clients.Network == nil {
+        return nil, errors.New("service network indisponible")
+    }
+    pages, err := floatingips.List(cl.clients.Network, floatingips.ListOpts{
+        ProjectID: cl.projectID,
+    }).AllPages()
+    if err != nil {
+        return nil, err
+    }
+    list, err := floatingips.ExtractFloatingIPs(pages)
+    if err != nil {
+        return nil, err
+    }
+    out := make([]Resource, 0, len(list))
+    for _, f := range list {
+        extra := fmt.Sprintf("ip=%s", f.FloatingIP)
+        if f.PortID != "" {
+            extra += fmt.Sprintf(" port=%s fixed=%s", f.PortID, f.FixedIP)
+        } else {
+            extra += " (non associée)"
+        }
+        out = append(out, Resource{
+            Kind:   KindFloatingIP,
+            ID:     f.ID,
+            Name:   f.FloatingIP, // pas de champ Name : on affiche l'adresse
+            Status: f.Status,
+            Extra:  extra,
+        })
+    }
+    return out, nil
+}
 
+func (cl *Cleaner) listNetworks() ([]Resource, error) {
+    if cl.clients.Network == nil {
+        return nil, errors.New("service network indisponible")
+    }
+    pages, err := networks.List(cl.clients.Network, networks.ListOpts{
+        ProjectID: cl.projectID,
+    }).AllPages()
+    if err != nil {
+        return nil, err
+    }
+    list, err := networks.ExtractNetworks(pages)
+    if err != nil {
+        return nil, err
+    }
+    out := make([]Resource, 0, len(list))
+    for _, n := range list {
+        // Les réseaux partagés/externes n'appartiennent pas vraiment au projet :
+        // on ne tente jamais de les détruire.
+        if n.Shared {
+            cl.log.Debug("réseau partagé ignoré", "id", n.ID, "name", n.Name)
+            continue
+        }
+        out = append(out, Resource{
+            Kind:   KindNetwork,
+            ID:     n.ID,
+            Name:   n.Name,
+            Status: n.Status,
+            Extra:  fmt.Sprintf("subnets=%d", len(n.Subnets)),
+        })
+    }
+    return out, nil
+}
 func (cl *Cleaner) listServers() ([]Resource, error) {
     if cl.clients.Compute == nil {
         return nil, errors.New("service compute indisponible")
@@ -491,7 +565,8 @@ func (cl *Cleaner) Cleanup() {
         }
 
         // Laisse le temps au backend de libérer les dépendances
-        if !cl.dryRun && (kind == KindServer || kind == KindSnapshot) {
+        if !cl.dryRun && (kind == KindServer || kind == KindSnapshot ||
+            kind == KindFloatingIP || kind == KindRouter) {
             cl.waitSettle(kind)
         }
     }
@@ -537,11 +612,75 @@ func (cl *Cleaner) deleteOne(r Resource) error {
 
     case KindRouter:
         return cl.deleteRouter(r.ID)
-    }
 
+    case KindFloatingIP:
+        // Si la FIP est associée, on la dissocie d'abord (PortID vide),
+        // sinon Neutron refuse parfois la suppression directe.
+        if strings.Contains(r.Extra, "port=") {
+            empty := ""
+            if _, uerr := floatingips.Update(cl.clients.Network, r.ID,
+                floatingips.UpdateOpts{PortID: &empty}).Extract(); uerr != nil && !isNotFound(uerr) {
+                cl.log.Warn("dissociation de la floating IP échouée, suppression directe",
+                    "id", r.ID, "error", uerr)
+            }
+        }
+        return floatingips.Delete(cl.clients.Network, r.ID).ExtractErr()
+
+    case KindNetwork:
+        return cl.deleteNetwork(r.ID)
+    }
     return fmt.Errorf("type de ressource non pris en charge: %s", r.Kind)
 }
 
+// deleteNetwork supprime les subnets du réseau puis le réseau lui-même.
+func (cl *Cleaner) deleteNetwork(networkID string) error {
+    // 1. Purger les ports résiduels (agents DHCP, ports orphelins).
+    pages, err := ports.List(cl.clients.Network, ports.ListOpts{
+        NetworkID: networkID,
+    }).AllPages()
+    if err != nil {
+        cl.log.Warn("listing des ports du réseau impossible", "network_id", networkID, "error", err)
+    } else {
+        netPorts, eerr := ports.ExtractPorts(pages)
+        if eerr != nil {
+            cl.log.Warn("extraction des ports du réseau impossible", "network_id", networkID, "error", eerr)
+        }
+        for _, p := range netPorts {
+            // Les interfaces de routeur sont gérées par deleteRouter ; on ignore.
+            if strings.HasPrefix(p.DeviceOwner, "network:router_") {
+                continue
+            }
+            cl.log.Debug("suppression port résiduel", "network_id", networkID, "port_id", p.ID)
+            if derr := ports.Delete(cl.clients.Network, p.ID).ExtractErr(); derr != nil && !isNotFound(derr) {
+                cl.log.Warn("suppression du port résiduel échouée", "port_id", p.ID, "error", derr)
+            }
+        }
+    }
+
+    // 2. Supprimer les subnets.
+    spages, err := subnets.List(cl.clients.Network, subnets.ListOpts{
+        NetworkID: networkID,
+    }).AllPages()
+    if err != nil {
+        return fmt.Errorf("listing des subnets: %w", err)
+    }
+    subnetList, err := subnets.ExtractSubnets(spages)
+    if err != nil {
+        return fmt.Errorf("extraction des subnets: %w", err)
+    }
+    for _, s := range subnetList {
+        cl.log.Debug("suppression subnet", "network_id", networkID, "subnet_id", s.ID)
+        if derr := subnets.Delete(cl.clients.Network, s.ID).ExtractErr(); derr != nil && !isNotFound(derr) {
+            return fmt.Errorf("suppression du subnet %s (%s): %w", s.Name, s.ID, derr)
+        }
+    }
+
+    // 3. Supprimer le réseau.
+    if derr := networks.Delete(cl.clients.Network, networkID).ExtractErr(); derr != nil && !isNotFound(derr) {
+        return derr
+    }
+    return nil
+}
 func (cl *Cleaner) deleteRouter(routerID string) error {
     // 1. Lister les ports attachés à ce routeur (interfaces de subnets)
     pages, err := ports.List(cl.clients.Network, ports.ListOpts{
