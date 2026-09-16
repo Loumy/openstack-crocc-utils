@@ -80,6 +80,7 @@ const (
     KindPort       ResourceKind = "network/port"
     KindRouter     ResourceKind = "network/router"
     KindNetwork    ResourceKind = "network/network"
+    KindProject    ResourceKind = "identity/project" // suppression optionnelle du projet Keystone
 )
 
 
@@ -169,8 +170,9 @@ type Cleaner struct {
     projectID string
     projName  string
 
-    dryRun  bool
-    timeout time.Duration
+    dryRun       bool
+    deleteProject bool // supprime le projet Keystone lui-même après nettoyage des ressources
+    timeout      time.Duration
 
     inventory map[ResourceKind][]Resource
     stats     map[ResourceKind]*Stats
@@ -189,6 +191,11 @@ func NewCleaner(log *slog.Logger, cl *Clients, projectID, projName string, dryRu
         inventory: make(map[ResourceKind][]Resource),
         stats:     make(map[ResourceKind]*Stats),
     }
+}
+
+// SetDeleteProject active la suppression du projet Keystone après nettoyage.
+func (cl *Cleaner) SetDeleteProject(v bool) {
+    cl.deleteProject = v
 }
 
 func (cl *Cleaner) stat(k ResourceKind) *Stats {
@@ -570,6 +577,63 @@ func (cl *Cleaner) Cleanup() {
             cl.waitSettle(kind)
         }
     }
+}
+
+// DeleteProject supprime le projet Keystone lui-même via l'API Identity v3.
+// Doit être appelée après Cleanup() pour respecter l'ordre de dépendance
+// (toutes les ressources du projet doivent être détruites avant le projet).
+func (cl *Cleaner) DeleteProject() {
+    if !cl.deleteProject {
+        return
+    }
+    if cl.dryRun {
+        section("PHASE 2b — SIMULATION : SUPPRESSION DU PROJET KEYSTONE")
+        fmt.Printf("\n%s %s %s %s\n", symInfo(), c(colBold, string(KindProject)),
+            c(colGrey, "—"), c(colYellow, "SERAIT SUPPRIMÉ"))
+        fmt.Printf("   %s %s %s\n", symDry(), c(colYellow, "SERAIT SUPPRIMÉ"),
+            fmt.Sprintf("%s %s", cl.projName, c(colGrey, "("+cl.projectID+")")))
+        cl.stat(KindProject).Skipped++
+        cl.log.Info("dry-run delete project", "id", cl.projectID, "name", cl.projName)
+        return
+    }
+
+    section("PHASE 2b — SUPPRESSION DU PROJET KEYSTONE")
+
+    if cl.clients.Identity == nil {
+        err := errors.New("service identity indisponible : impossible de supprimer le projet")
+        cl.stat(KindProject).Failed++
+        cl.addErr("delete", KindProject, fmt.Sprintf("%s (%s)", cl.projName, cl.projectID), err)
+        cl.log.Error("suppression du projet impossible", "id", cl.projectID, "error", err)
+        fmt.Printf("   %s %s %s\n", symFail(),
+            fmt.Sprintf("%s %s", cl.projName, c(colGrey, "("+cl.projectID+")")),
+            c(colRed, "— "+err.Error()))
+        return
+    }
+
+    err := projects.Delete(cl.clients.Identity, cl.projectID).ExtractErr()
+    if err != nil && isNotFound(err) {
+        // Projet déjà absent : on considère l'opération comme réussie (idempotence).
+        cl.stat(KindProject).Skipped++
+        cl.log.Warn("projet déjà supprimé côté Keystone", "id", cl.projectID, "name", cl.projName)
+        fmt.Printf("   %s %s %s\n", symWarn(),
+            fmt.Sprintf("%s %s", cl.projName, c(colGrey, "("+cl.projectID+")")),
+            c(colYellow, "— déjà absent"))
+        return
+    }
+    if err != nil {
+        cl.stat(KindProject).Failed++
+        cl.addErr("delete", KindProject, fmt.Sprintf("%s (%s)", cl.projName, cl.projectID), err)
+        cl.log.Error("suppression du projet échouée", "id", cl.projectID, "error", err)
+        fmt.Printf("   %s %s %s\n", symFail(),
+            fmt.Sprintf("%s %s", cl.projName, c(colGrey, "("+cl.projectID+")")),
+            c(colRed, "— "+err.Error()))
+        return
+    }
+
+    cl.stat(KindProject).Deleted++
+    cl.log.Info("projet supprimé", "id", cl.projectID, "name", cl.projName)
+    fmt.Printf("   %s %s\n", symOK(),
+        fmt.Sprintf("%s %s", cl.projName, c(colGrey, "("+cl.projectID+")")))
 }
 
 // deleteOne aiguille vers l'appel API correspondant au type de ressource.
@@ -975,6 +1039,9 @@ func main() {
             "Ne pas demander de retaper le nom du projet")
         skipDeletePrompt = flag.Bool("skip-delete-prompt", false,
             "Ne pas demander de taper SUPPRIMER")
+
+        deleteProject = flag.Bool("delete-project", false,
+            "Supprime également le projet Keystone lui-même après nettoyage des ressources (destructif, nécessite --dry-run=false)")
     
         verbose = flag.Bool("verbose", false, "Active les logs de niveau DEBUG")
         noColor = flag.Bool("no-color", false, "Désactive les couleurs ANSI")
@@ -990,6 +1057,7 @@ func main() {
         fmt.Fprintf(os.Stderr, "  OS_CLOUD=prod %s --project sandbox --dry-run=false\n", os.Args[0])
         fmt.Fprintf(os.Stderr, "  OS_CLOUD=prod %s --project sandbox --dry-run=false --skip-delete-prompt\n", os.Args[0])
         fmt.Fprintf(os.Stderr, "  OS_CLOUD=prod %s --project sandbox --dry-run=false --yes   # CI/CD\n", os.Args[0])
+        fmt.Fprintf(os.Stderr, "  OS_CLOUD=prod %s --project sandbox --dry-run=false --delete-project --yes  # supprime aussi le projet Keystone\n", os.Args[0])
     }
     flag.Parse()
 
@@ -1015,6 +1083,11 @@ func main() {
     if *cloud == "" {
         fmt.Fprintf(os.Stderr, "%s %s\n", symFail(),
             c(colRed, "OS_CLOUD n'est pas défini (ou utilisez --cloud)"))
+        os.Exit(2)
+    }
+    if *deleteProject && *dryRun {
+        fmt.Fprintf(os.Stderr, "%s %s\n", symFail(),
+            c(colRed, "--delete-project exige --dry-run=false (les ressources doivent être réellement supprimées avant le projet)"))
         os.Exit(2)
     }
 
@@ -1043,6 +1116,7 @@ func main() {
     log.Info("projet résolu", "name", projectName, "id", projectID)
 
     cleaner := NewCleaner(log, clients, projectID, projectName, *dryRun, *timeout)
+    cleaner.SetDeleteProject(*deleteProject)
 
     // Phase 1 : inventaire
     cleaner.Discover()
@@ -1051,7 +1125,7 @@ func main() {
     for _, res := range cleaner.inventory {
         total += len(res)
     }
-    if total == 0 {
+    if total == 0 && !*deleteProject {
         fmt.Printf("\n%s %s\n", symOK(), c(colGreen, "Aucune ressource à supprimer : le projet est déjà propre."))
         os.Exit(cleaner.Report())
     }
@@ -1066,8 +1140,11 @@ func main() {
         }
     }
 
-    // Phase 2 : suppression
+    // Phase 2 : suppression des ressources
     cleaner.Cleanup()
+
+    // Phase 2b : suppression optionnelle du projet Keystone lui-même
+    cleaner.DeleteProject()
 
     // Phase 3 : rapport final
     os.Exit(cleaner.Report())
