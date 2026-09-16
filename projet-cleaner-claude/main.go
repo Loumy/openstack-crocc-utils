@@ -916,28 +916,46 @@ func section(title string) {
 }
 
 // confirm demande une double confirmation avant destruction réelle.
-func confirm(projectName string, total int) bool {
+// askProject / askDelete permettent de désactiver indépendamment chaque étape.
+func confirm(projectName string, total int, askProject, askDelete bool) bool {
     fmt.Printf("\n%s %s\n", symWarn(),
         c(colBold+colRed, "ATTENTION : MODE PRODUCTION — SUPPRESSION IRRÉVERSIBLE"))
     fmt.Printf("%s %d ressource(s) du projet %s vont être définitivement supprimées.\n",
         symInfo(), total, c(colBold, projectName))
-    fmt.Printf("\nPour confirmer, tapez exactement le nom du projet (%s) : ",
-        c(colYellow, projectName))
 
-    var answer string
-    if _, err := fmt.Scanln(&answer); err != nil {
-        return false
-    }
-    if strings.TrimSpace(answer) != projectName {
-        return false
+    if !askProject && !askDelete {
+        fmt.Printf("%s %s\n", symWarn(),
+            c(colYellow, "Confirmations désactivées par les options — poursuite immédiate."))
+        return true
     }
 
-    fmt.Printf("Confirmez une dernière fois en tapant %s : ", c(colYellow, "SUPPRIMER"))
-    var second string
-    if _, err := fmt.Scanln(&second); err != nil {
-        return false
+    if askProject {
+        fmt.Printf("\nPour confirmer, tapez exactement le nom du projet (%s) : ",
+            c(colYellow, projectName))
+        var answer string
+        if _, err := fmt.Scanln(&answer); err != nil {
+            return false
+        }
+        if strings.TrimSpace(answer) != projectName {
+            return false
+        }
+    } else {
+        fmt.Printf("%s %s\n", symWarn(),
+            c(colYellow, "Saisie du nom du projet ignorée (--skip-project-prompt)."))
     }
-    return strings.TrimSpace(second) == "SUPPRIMER"
+
+    if askDelete {
+        fmt.Printf("Confirmez une dernière fois en tapant %s : ", c(colYellow, "SUPPRIMER"))
+        var second string
+        if _, err := fmt.Scanln(&second); err != nil {
+            return false
+        }
+        return strings.TrimSpace(second) == "SUPPRIMER"
+    }
+
+    fmt.Printf("%s %s\n", symWarn(),
+        c(colYellow, "Saisie de SUPPRIMER ignorée (--skip-delete-prompt)."))
+    return true
 }
 
 /* -------------------------------------------------------------------------- */
@@ -945,11 +963,19 @@ func confirm(projectName string, total int) bool {
 /* -------------------------------------------------------------------------- */
 
 func main() {
+	
     var (
         project = flag.String("project", "", "Nom (ou ID) du projet OpenStack à nettoyer — obligatoire")
         cloud   = flag.String("cloud", os.Getenv("OS_CLOUD"), "Entrée clouds.yaml à utiliser (défaut: $OS_CLOUD)")
         dryRun  = flag.Bool("dry-run", true, "Mode simulation : n'effectue aucune suppression (défaut: true)")
         yes     = flag.Bool("yes", false, "Ne pas demander de confirmation interactive (CI/CD)")
+        force   = flag.Bool("force", false, "Alias de --yes : supprime sans aucune confirmation")
+    
+        skipProjectPrompt = flag.Bool("skip-project-prompt", false,
+            "Ne pas demander de retaper le nom du projet")
+        skipDeletePrompt = flag.Bool("skip-delete-prompt", false,
+            "Ne pas demander de taper SUPPRIMER")
+    
         verbose = flag.Bool("verbose", false, "Active les logs de niveau DEBUG")
         noColor = flag.Bool("no-color", false, "Désactive les couleurs ANSI")
         timeout = flag.Duration("timeout", 10*time.Minute, "Timeout global des appels API")
@@ -959,9 +985,11 @@ func main() {
         fmt.Fprintf(os.Stderr, "openstack-cleaner — nettoyage des ressources d'un projet OpenStack\n\n")
         fmt.Fprintf(os.Stderr, "Usage:\n  %s --project <nom> [options]\n\nOptions:\n", os.Args[0])
         flag.PrintDefaults()
-        fmt.Fprintf(os.Stderr, "\nExemples:\n")
+	fmt.Fprintf(os.Stderr, "\nExemples:\n")
         fmt.Fprintf(os.Stderr, "  OS_CLOUD=prod %s --project sandbox\n", os.Args[0])
         fmt.Fprintf(os.Stderr, "  OS_CLOUD=prod %s --project sandbox --dry-run=false\n", os.Args[0])
+        fmt.Fprintf(os.Stderr, "  OS_CLOUD=prod %s --project sandbox --dry-run=false --skip-delete-prompt\n", os.Args[0])
+        fmt.Fprintf(os.Stderr, "  OS_CLOUD=prod %s --project sandbox --dry-run=false --yes   # CI/CD\n", os.Args[0])
     }
     flag.Parse()
 
@@ -1029,8 +1057,9 @@ func main() {
     }
 
     // Confirmation en mode production
-    if !*dryRun && !*yes {
-        if !confirm(projectName, total) {
+    noPrompt := *yes || *force
+    if !*dryRun && !noPrompt {
+        if !confirm(projectName, total, !*skipProjectPrompt, !*skipDeletePrompt) {
             fmt.Printf("\n%s %s\n", symWarn(), c(colYellow, "Confirmation invalide — opération annulée."))
             log.Warn("suppression annulée par l'utilisateur")
             os.Exit(130)
